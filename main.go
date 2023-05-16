@@ -45,10 +45,10 @@ var RTPVideoPayloadType = flag.Uint("RTPVideoPayloadType", 125, "The payload typ
 // RTCPIntervalMs - How often (ms) to send RTCP messages (such as REMB, PLI)
 var RTCPIntervalMs = flag.Int("RTCPIntervalMs", 2000, "How often (ms) to send RTCP message such as REMB, PLI.")
 
-//Whether or not to send PLI messages on an interval.
+// Whether or not to send PLI messages on an interval.
 var RTCPSendPLI = flag.Bool("RTCPSendPLI", true, "Whether or not to send PLI messages on an interval.")
 
-//Whether or not to send REMB messages on an interval.
+// Whether or not to send REMB messages on an interval.
 var RTCPSendREMB = flag.Bool("RTCPSendREMB", true, "Whether or not to send REMB messages on an interval.")
 
 // Receiver-side estimated maximum bitrate.
@@ -73,27 +73,6 @@ func writeWSMessage(wsConn *websocket.Conn, msg string) {
 	if err != nil {
 		log.Println("Error writing websocket message: ", err)
 	}
-}
-
-func createOffer(peerConnection *webrtc.PeerConnection) (string, error) {
-	offer, err := peerConnection.CreateOffer(nil)
-	if err != nil {
-		log.Println("Error creating peer connection offer: ", err)
-		return "", err
-	}
-
-	if err = peerConnection.SetLocalDescription(offer); err != nil {
-		log.Println("Error setting local description of peer connection: ", err)
-		return "", err
-	}
-
-	offerStringBytes, err := json.Marshal(offer)
-	if err != nil {
-		log.Println("Error unmarshalling json from offer object: ", err)
-		return "", err
-	}
-	offerString := string(offerStringBytes)
-	return offerString, err
 }
 
 func createPeerConnection() (*webrtc.PeerConnection, error) {
@@ -150,10 +129,20 @@ func handleRemoteAnswer(message []byte, peerConnection *webrtc.PeerConnection, w
 	}
 
 	// Set remote session description we got from UE pixel streaming
+	if sdpErr := peerConnection.SetLocalDescription(sdp); sdpErr != nil {
+		log.Printf("Error occured setting local session description. Error: %s", sdpErr.Error())
+		return
+	} else {
+		log.Printf("Success set local session description")
+	}
+
 	if sdpErr := peerConnection.SetRemoteDescription(sdp); sdpErr != nil {
 		log.Printf("Error occured setting remote session description. Error: %s", sdpErr.Error())
 		return
+	} else {
+		log.Printf("Success set remote session description")
 	}
+
 	fmt.Println("Added session description from UE to Pion.")
 
 	// User websocket to send our local ICE candidates to UE
@@ -179,14 +168,13 @@ func handleRemoteIceCandidate(message []byte, peerConnection *webrtc.PeerConnect
 		return
 	}
 
-	fmt.Println(fmt.Sprintf("Added remote ice candidate from UE - %s", iceCandidateInit.Candidate))
+	fmt.Println(fmt.Sprintf("Added remote ice candidate from UE"))
 }
 
 // Starts an infinite loop where we poll for new websocket messages and react to them.
 func startControlLoop(wsConn *websocket.Conn, peerConnection *webrtc.PeerConnection, pendingCandidates *[]*webrtc.ICECandidate) {
 	// Start loop here to read web socket messages
 	for {
-
 		messageType, message, err := wsConn.ReadMessage()
 		if err != nil {
 			log.Printf("Websocket read message error: %v", err)
@@ -235,25 +223,22 @@ func startControlLoop(wsConn *websocket.Conn, peerConnection *webrtc.PeerConnect
 		case "iceCandidate":
 			candidateMsg := objmap["candidate"]
 			handleRemoteIceCandidate(candidateMsg, peerConnection)
+		case "offer":
+			sdp := webrtc.SessionDescription{}
+			if unmarshalError := json.Unmarshal([]byte(message), &sdp); unmarshalError != nil {
+				log.Printf("Error occured during unmarshaling sdp. Error: %s", unmarshalError.Error())
+				return
+			}
+			if err := peerConnection.SetRemoteDescription(sdp); err != nil {
+				log.Println("Error setting remote description of peer connection: ", err)
+			}
+
+			sendAnswer(wsConn, peerConnection)
+
 		default:
 			log.Println("Got message we do not specifically handle, type was: " + pixelStreamingMessageType)
 		}
 
-	}
-}
-
-// Send an "offer" string over websocket to Unreal Engine to start the WebRTC handshake.
-func sendOffer(wsConn *websocket.Conn, peerConnection *webrtc.PeerConnection) {
-
-	offerString, err := createOffer(peerConnection)
-
-	if err != nil {
-		log.Printf("Error creating offer. Error: %s", err.Error())
-	} else {
-		// Write our offer over websocket: "{"type":"offer","sdp":"v=0\r\no=- 2927396662845926191 2 IN IP4 127.0.0.1....."
-		writeWSMessage(wsConn, offerString)
-		fmt.Println("Sending offer...")
-		fmt.Println(offerString)
 	}
 }
 
@@ -338,7 +323,7 @@ func setupMediaForwarding(peerConnection *webrtc.PeerConnection) (*udpConn, *udp
 
 				// Send REMB (receiver-side estimated maximum bandwidth)
 				if *RTCPSendREMB {
-					if rtcpErr := peerConnection.WriteRTCP([]rtcp.Packet{&rtcp.ReceiverEstimatedMaximumBitrate{Bitrate: *REMB, SSRCs: []uint32{uint32(track.SSRC())}}}); rtcpErr != nil {
+					if rtcpErr := peerConnection.WriteRTCP([]rtcp.Packet{&rtcp.ReceiverEstimatedMaximumBitrate{Bitrate: float32(*REMB), SSRCs: []uint32{uint32(track.SSRC())}}}); rtcpErr != nil {
 						fmt.Println(rtcpErr)
 					}
 				}
@@ -385,11 +370,45 @@ func setupMediaForwarding(peerConnection *webrtc.PeerConnection) (*udpConn, *udp
 	return videoUDPConn, audioUDPConn
 }
 
+func createAnswer(peerConnection *webrtc.PeerConnection) (string, error) {
+	answer, err := peerConnection.CreateAnswer(nil)
+	if err != nil {
+		log.Println("Error creating peer connection answer: ", err)
+		return "", err
+	}
+
+	if err = peerConnection.SetLocalDescription(answer); err != nil {
+		log.Println("Error setting remote description of peer connection: ", err)
+	}
+
+	answerStringBytes, err := json.Marshal(answer)
+	if err != nil {
+		log.Println("Error unmarshalling json from offer object: ", err)
+		return "", err
+	}
+	answerString := string(answerStringBytes)
+	return answerString, err
+}
+
+func sendAnswer(wsConn *websocket.Conn, peerConnection *webrtc.PeerConnection) {
+	answerString, err := createAnswer(peerConnection)
+
+	if err != nil {
+		log.Printf("Error creating answer. Error: %s", err.Error())
+	} else {
+		// Write our offer over websocket: "{"type":"answer","sdp":"v=0\r\no=- 2927396662845926191 2 IN IP4 127.0.0.1....."
+		writeWSMessage(wsConn, answerString)
+		fmt.Println("Sending answer...")
+		fmt.Println(answerString)
+	}
+}
+
 func main() {
 	flag.Parse()
 
 	// Setup a websocket connection between this application and the Cirrus webserver.
 	serverURL := url.URL{Scheme: "ws", Host: fmt.Sprintf("%s:%d", *CirrusAddress, *CirrusPort), Path: "/"}
+
 	wsConn, _, err := websocket.DefaultDialer.Dial(serverURL.String(), nil)
 	if err != nil {
 		log.Fatal("Websocket dialing error: ", err)
@@ -409,6 +428,8 @@ func main() {
 	// Setup a callback to capture our local ice candidates when they are ready
 	// Note: can happen at random times so might be before or after we have sent offer.
 	peerConnection.OnICECandidate(func(localIceCandidate *webrtc.ICECandidate) {
+		log.Println("OnICECandidate")
+		log.Println(localIceCandidate)
 		if localIceCandidate == nil {
 			return
 		}
@@ -416,7 +437,7 @@ func main() {
 		desc := peerConnection.RemoteDescription()
 		if desc == nil {
 			pendingCandidates = append(pendingCandidates, localIceCandidate)
-			fmt.Println("Added local ICE candidate that we will send off later...")
+			log.Println("Added local ICE candidate that we will send off later...")
 		} else {
 			sendLocalIceCandidate(wsConn, localIceCandidate)
 		}
@@ -438,11 +459,20 @@ func main() {
 		}
 	})
 
+	peerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		fmt.Printf("Peer Connection State has changed: %s\n", s.String())
+
+		if s == webrtc.PeerConnectionStateFailed {
+			// Wait until PeerConnection has had no network activity for 30 seconds or another failure. It may be reconnected using an ICE Restart.
+			// Use webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster timeout.
+			// Note that the PeerConnection may come back from PeerConnectionStateDisconnected.
+			log.Println("Peer Connection has gone to failed exiting")
+		}
+	})
+
 	videoUDP, audioUDP := setupMediaForwarding(peerConnection)
 	defer videoUDP.conn.Close()
 	defer audioUDP.conn.Close()
 
-	sendOffer(wsConn, peerConnection)
 	startControlLoop(wsConn, peerConnection, &pendingCandidates)
-
 }
